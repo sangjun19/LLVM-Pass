@@ -20,7 +20,7 @@ struct FuncNamePass : public PassInfoMixin<FuncNamePass> {
 extern "C" LLVM_ATTRIBUTE_WEAK ::llvm::PassPluginLibraryInfo
 llvmGetPassPluginInfo() {
   return {
-    LLVM_PLUGIN_API_VERSION, "FuncNamePass", LLVM_VERSION_STRING,
+    LLVM_PLUGIN_API_VERSION, "testPass", LLVM_VERSION_STRING,
     [](PassBuilder &PB) {
       PB.registerPipelineParsingCallback(
         [](StringRef Name, FunctionPassManager &FPM,

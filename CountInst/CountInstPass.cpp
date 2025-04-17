@@ -20,7 +20,7 @@ struct CountInstPass : PassInfoMixin<CountInstPass> {
     return PreservedAnalyses::all();
   }
 };
-} // namespace
+}
 
 extern "C" LLVM_ATTRIBUTE_WEAK PassPluginLibraryInfo llvmGetPassPluginInfo() {
   return {
