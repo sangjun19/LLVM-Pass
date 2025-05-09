@@ -9,14 +9,15 @@ using namespace llvm;
 namespace {
 struct CountInstPass : PassInfoMixin<CountInstPass> {
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
+    errs() << "Running CountInstPass on " << F.getName() << "\n";
+    
     unsigned instCount = 0;
     
     for (BasicBlock &BB : F) {
       instCount += BB.size();
     }
     
-    errs() << "Instruction count for " << F.getName() 
-           << ": " << instCount << "\n";
+    errs() << "Instruction count for " << F.getName()  << ": " << instCount << "\n";
     return PreservedAnalyses::all();
   }
 };
