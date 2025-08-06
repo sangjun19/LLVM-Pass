@@ -11,15 +11,16 @@ namespace {
 class CallInstCountPass : public PassInfoMixin<CallInstCountPass> {
 public:
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
-        errs() << "[*] Function: " << F.getName() << "\n";
+        // errs() << "[*] Function: " << F.getName() << "\n";
 
         for (auto &BB : F) {
             for (auto &I : BB) {
                 if (auto *CI = dyn_cast<CallInst>(&I)) {
                     if (Function *calledFunc = CI->getCalledFunction()) {
-                        errs() << "  Called: " << calledFunc->getName() << "\n";
+                        errs() << calledFunc->getName() << "\n";
                     } else {
-                        errs() << "  Indirect Call or External Function\n";
+                        errs() << "Indirect Call or External Function : ";
+                        CI->print(errs());
                         errs() << "\n";
                     }
                 }
