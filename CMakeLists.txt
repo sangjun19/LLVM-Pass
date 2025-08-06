@@ -1,0 +1,4 @@
+add_subdirectory(FuncName)
+add_subdirectory(CountInst)
+add_subdirectory(DetectSwitch)
+add_subdirectory(CallInstCount)
