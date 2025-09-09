@@ -4,22 +4,23 @@
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Passes/PassPlugin.h"
-
-// IR 수정을 위해 추가된 헤더
 #include "llvm/IR/IRBuilder.h"
-#include "llvm/Transforms/Utils/BasicBlockUtils.h" // SplitEdge를 위해 필요
 
 #include <map>
+#include <vector>
 
 using namespace llvm;
 
 namespace {
 
-class FreqBlock : public PassInfoMixin<FreqBlock> {
+// Pass 클래스
+class DummyFunc : public PassInfoMixin<DummyFunc> {
 public:
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &) {
-        // 1. 가장 많이 진입하는 블록 찾기 (기존 코드와 동일)
+        // 각 블럭의 진입횟수 저장할 map
         std::map<const BasicBlock*, unsigned> blockPredecessorCounts;
+
+        // 함수의 모든 BB를 순회하며 진입횟수 저장
         for (auto &BB : F) {
             const Instruction *terminator = BB.getTerminator();
             for (unsigned i = 0; i < terminator->getNumSuccessors(); ++i) {
@@ -28,8 +29,10 @@ public:
             }
         }
 
+        // 가장 많이 참조된 블럭 찾기
         const BasicBlock *mostFrequentBlock = nullptr;
         unsigned maxCount = 0;
+
         for (auto const& [block, count] : blockPredecessorCounts) {
             if (count > maxCount) {
                 maxCount = count;
@@ -37,70 +40,57 @@ public:
             }
         }
 
+        // 가장 많이 참조된 블록이 없으면 종료
         if (!mostFrequentBlock || maxCount == 0) {
             return PreservedAnalyses::all();
         }
 
-        errs() << "[*] 함수 '" << F.getName() << "' 분석 결과:\n";
-        errs() << "    가장 많은 진입점을 가진 블록: ";
-        if (mostFrequentBlock->hasName()) {
-            errs() << mostFrequentBlock->getName() << "\n";
-        } else {
-            errs() << mostFrequentBlock << "\n";
-        }
-        errs() << "    진입 횟수: " << maxCount << "\n";
+        // 분석 결과
+        errs() << "[*] Function '" << F.getName() << "'\n";
+        errs() << "Most Frequent BB: ";
+        mostFrequentBlock->printAsOperand(errs(), false);
+        errs() << "\n";
+        errs() << "Count: " << maxCount << "\n";
 
+        // Context, Module 선언
         LLVMContext &Ctx = F.getContext();
         Module *M = F.getParent();
 
+        // 모듈에 더미함수 선언이 없다면 추가
         FunctionType *dummyFuncType = FunctionType::get(Type::getVoidTy(Ctx), false);
         FunctionCallee dummyFunc = M->getOrInsertFunction("dummy_function", dummyFuncType);
 
+        // 수정할 대상 블록
         BasicBlock *targetBlock = const_cast<BasicBlock*>(mostFrequentBlock);
+
+        // 블럭 종료 명렁어 찾기
+        Instruction *terminator = targetBlock->getTerminator();
         
-        // ================== 수정된 부분 시작 ==================
+        // IRBuilder로 종료 명령어 바로 위에 함수 호출 삽입
+        IRBuilder<> builder(terminator);
+        builder.CreateCall(dummyFunc);
+
+        errs() << "[+] '";
+        targetBlock->printAsOperand(errs(), false);
+        errs() << "' Insert dummy_function call\n";
         
-        // predecessor 리스트를 복사할 벡터의 이름을 "predecessorVec"으로 변경
-        std::vector<BasicBlock*> predecessorVec;
-        for (BasicBlock *pred : predecessors(targetBlock)) {
-            predecessorVec.push_back(pred);
-        }
-
-        // 복사된 벡터(predecessorVec)를 사용하여 순회
-        for (BasicBlock *pred : predecessorVec) {
-            Instruction *terminator = pred->getTerminator();
-            if (terminator->getNumSuccessors() > 1) {
-                BasicBlock *newBlock = SplitEdge(pred, targetBlock);
-                
-                IRBuilder<> builder(newBlock->getFirstNonPHI());
-                builder.CreateCall(dummyFunc);
-                errs() << "    [+] 크리티컬 엣지 분리 후 '" << pred->getName() << "' -> '" << newBlock->getName() << "'에 dummy_function 호출 삽입\n";
-
-            } else {
-                IRBuilder<> builder(terminator);
-                builder.CreateCall(dummyFunc);
-                errs() << "    [+] '" << pred->getName() << "'에 dummy_function 호출 삽입\n";
-            }
-        }
-        // ================== 수정된 부분 끝 ====================
-
+        // IR이 수정됐음을 알림
         return PreservedAnalyses::none();
     }
 };
 
-} // end anonymous namespace
+}
 
-// Plugin registration (기존 코드와 동일)
 extern "C" ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
     return {
         LLVM_PLUGIN_API_VERSION,
-        "FreqBlock", "v0.1",
+        "DummyFunc", "v0.1",
         [](PassBuilder &PB) {
             PB.registerPipelineParsingCallback(
                 [](StringRef Name, FunctionPassManager &FPM,
                 ArrayRef<PassBuilder::PipelineElement>) {
-                    if (Name == "freqblock") {
-                        FPM.addPass(FreqBlock());
+                    if (Name == "dummyfunc") {
+                        FPM.addPass(DummyFunc());
                         return true;
                     }
                     return false;
