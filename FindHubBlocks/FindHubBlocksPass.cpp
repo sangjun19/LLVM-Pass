@@ -71,7 +71,7 @@ public:
             errs() << "-> BB: ";
             predCandidate->printAsOperand(errs(), false);
             errs() << "\n";
-            errs() << ", Count: " << maxPreds << "\n";
+            errs() << "-> Count: " << maxPreds << "\n";
 
             FunctionType *dummyFuncType = FunctionType::get(Type::getVoidTy(Ctx), false);
             FunctionCallee dummyFunc = M->getOrInsertFunction("dummy_function_pred", dummyFuncType);
@@ -115,7 +115,6 @@ public:
 
 } // anonymous namespace
 
-// Pass 등록 (이름 변경)
 extern "C" ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
     return {
         LLVM_PLUGIN_API_VERSION,
@@ -127,7 +126,7 @@ extern "C" ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
                                    ArrayRef<PassBuilder::PipelineElement>)>;
 
             PB.registerPipelineParsingCallback(
-                PipelineParsingCallback( // std::function으로 람다를 감싸줍니다.
+                PipelineParsingCallback(
                     [](StringRef Name, FunctionPassManager &FPM,
                        ArrayRef<PassBuilder::PipelineElement>) {
                         if (Name == "findhubblocks") {
