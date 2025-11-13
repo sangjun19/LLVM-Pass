@@ -60,6 +60,25 @@ bool hasNonTerminatorInstructions(BasicBlock *BB) {
     return instCount > 1;
 }
 
+// VM_end_handler 블록의 모든 후행자를 재귀적으로 수집하는 함수
+void collectAllSuccessors(BasicBlock *BB, std::set<BasicBlock*> &visited, std::set<BasicBlock*> &allSuccessors) {
+    if (visited.count(BB)) {
+        return;
+    }
+    visited.insert(BB);
+    
+    Instruction *terminator = BB->getTerminator();
+    if (!terminator) {
+        return;
+    }
+    
+    for (unsigned i = 0; i < terminator->getNumSuccessors(); ++i) {
+        BasicBlock *successor = terminator->getSuccessor(i);
+        allSuccessors.insert(successor);
+        collectAllSuccessors(successor, visited, allSuccessors);
+    }
+}
+
 
 class VMTagPass : public PassInfoMixin<VMTagPass> {
 public:
@@ -130,6 +149,9 @@ public:
                 
                 // 조건 분기 핸들러의 합류 지점을 추적
                 std::set<BasicBlock*> conditionalBranchConvergencePoints;
+                
+                // VM_end_handler 블록을 추적
+                BasicBlock *vmEndHandlerBlock = nullptr;
                 
                 for (BasicBlock *handler : handlers) {
                     Instruction *handlerTerminator = handler->getTerminator();
@@ -402,6 +424,9 @@ public:
                                     uniqueHandler->printAsOperand(errs(), false);
                                     errs() << "\n";
                                     irModified = true;
+                                    
+                                    // VM_end_handler 블록 저장
+                                    vmEndHandlerBlock = uniqueHandler;
                                 }
                             }
                         }
@@ -429,6 +454,40 @@ public:
                                 irModified = true;
                                 break; 
                             }
+                        }
+                    }
+                }
+                
+                // VM_end_handler 이후의 모든 블록에 NonVM 태그 삽입
+                if (vmEndHandlerBlock) {
+                    errs() << "--- Tagging Non-VM Region ---\n";
+                    
+                    FunctionType *nonVMFuncType = FunctionType::get(Type::getVoidTy(Ctx), false);
+                    FunctionCallee nonVMFunc = M->getOrInsertFunction("dummy_function_NonVM", nonVMFuncType);
+                    
+                    std::set<BasicBlock*> visited;
+                    std::set<BasicBlock*> nonVMBlocks;
+                    
+                    // VM_end_handler 블록의 모든 후행자를 재귀적으로 수집
+                    collectAllSuccessors(vmEndHandlerBlock, visited, nonVMBlocks);
+                    
+                    errs() << "[*] Found " << nonVMBlocks.size() << " blocks after VM_end_handler\n";
+                    
+                    // 각 NonVM 블록에 태그 삽입
+                    for (BasicBlock *nonVMBlock : nonVMBlocks) {
+                        // 이미 NonVM 태그가 있으면 스킵
+                        if (findCallTo(nonVMBlock, "dummy_function_NonVM")) {
+                            continue;
+                        }
+                        
+                        Instruction *nonVMTerminator = nonVMBlock->getTerminator();
+                        if (nonVMTerminator) {
+                            IRBuilder<> nonVMBuilder(nonVMTerminator);
+                            nonVMBuilder.CreateCall(nonVMFunc);
+                            errs() << "[+] Inserted dummy_function_NonVM call into BB: ";
+                            nonVMBlock->printAsOperand(errs(), false);
+                            errs() << "\n";
+                            irModified = true;
                         }
                     }
                 }
