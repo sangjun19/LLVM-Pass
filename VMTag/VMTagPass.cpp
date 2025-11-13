@@ -23,6 +23,7 @@ CallInst* findCallTo(BasicBlock *BB, StringRef FuncName) {
                 return CI;
             }
         }
+        // Terminator는 CallInst가 아니므로 건너뜁니다.
         if (BB->getTerminator() == &Inst) {
             continue;
         }
@@ -67,8 +68,6 @@ public:
             
             // Dispatcher/Handler Tagging
             if (succCandidate) {
-                // errs() << "--- Dispatcher/Handler Tagging ---\n";
-
                 // Dispatcher 블록에 dummy_function_dispatch_start 삽입
                 FunctionType *dispatchFuncType = FunctionType::get(Type::getVoidTy(Ctx), false);
                 FunctionCallee dispatchFunc = M->getOrInsertFunction("dummy_function_dispatch_start", dispatchFuncType);
@@ -119,11 +118,6 @@ public:
                             if (!findCallTo(caseBlock, "dummy_function_handler") &&
                                 !findCallTo(caseBlock, "dummy_function_VM_end_handler")) {
                                 
-                                // Dispatcher로 분기하는 경우 스킵
-                                // if (caseBlock == dispatcherBlock) {
-                                //     continue;
-                                // }
-                                
                                 IRBuilder<> caseBuilder(caseBlock->getTerminator());
                                 caseBuilder.CreateCall(standardHandlerFunc);
                                 irModified = true;
@@ -143,15 +137,11 @@ public:
                         for (unsigned i = 0; i < handlerTerminator->getNumSuccessors(); ++i) {
                             BasicBlock *target = handlerTerminator->getSuccessor(i);
                             handlerTargets[handler].insert(target);
-                            
-                            // Dispatcher로 분기하는 경우 핸들러 태그 삽입 안함
-                            // if (target == dispatcherBlock) {
-                            //     break;
-                            // }
                         }
                         
                         // Dispatcher로 분기하지 않는 경우만 핸들러 태그 삽입
                         bool branchesToDispatcher = false;
+                        // For loop to check if it branches to dispatcherBlock (kept commented out based on original code structure)
                         // for (unsigned i = 0; i < handlerTerminator->getNumSuccessors(); ++i) {
                         //     if (handlerTerminator->getSuccessor(i) == dispatcherBlock) {
                         //         branchesToDispatcher = true;
@@ -159,20 +149,11 @@ public:
                         //     }
                         // }
                         
-                        if (!branchesToDispatcher &&
-                            !findCallTo(uniqueHandler, "dummy_function_VM_end_handler") &&
-                            !isa<SwitchInst>(uniqueHandler->getTerminator()) &&
-                            (isa<BranchInst>(uniqueTerminator) && !cast<BranchInst>(uniqueTerminator)->isConditional())) {
-                                
-                                // 기존 dummy_function_handler가 있으면 제거
-                            if (CallInst *existingHandler = findCallTo(uniqueHandler, "dummy_function_handler")) {
-                                existingHandler->eraseFromParent();
-                            }
-
-                            IRBuilder<> endBuilder(uniqueHandler->getTerminator());
-                            endBuilder.CreateCall(endHandlerFunc);
-                            errs() << "[+] Inserted dummy_function_VM_end_handler into BB: ";
-                            uniqueHandler->printAsOperand(errs(), false);
+                        if (!branchesToDispatcher) {
+                            IRBuilder<> handlerBuilder(handlerTerminator);
+                            handlerBuilder.CreateCall(standardHandlerFunc);
+                            errs() << "[+] Inserted dummy_function_handler call into BB: ";
+                            handler->printAsOperand(errs(), false);
                             errs() << "\n";
                             irModified = true;
                         }
@@ -204,22 +185,27 @@ public:
                                 }
                             }
                             
-                            // dispatcher로 분기하지 않고, 이미 태그되지 않았고, switch가 아닌 경우
+                            // dispatcher로 분기하지 않고, 이미 태그되지 않았고, switch가 아니면서
+                            // 종료 명령어가 무조건 분기(Unconditional Branch)인 경우
                             if (!branchesToDispatcher &&
                                 !findCallTo(uniqueHandler, "dummy_function_VM_end_handler") &&
-                                !isa<SwitchInst>(uniqueHandler->getTerminator())) {
-                                
-                                // 기존 dummy_function_handler가 있으면 제거
-                                if (CallInst *existingHandler = findCallTo(uniqueHandler, "dummy_function_handler")) {
-                                    existingHandler->eraseFromParent();
+                                !isa<SwitchInst>(uniqueTerminator)) 
+                            {
+                                // 단일 분기(Unconditional Branch) 여부 최종 확인
+                                if (uniqueTerminator && isa<BranchInst>(uniqueTerminator) && !cast<BranchInst>(uniqueTerminator)->isConditional()) {
+                                    
+                                    // 기존 dummy_function_handler가 있으면 제거
+                                    if (CallInst *existingHandler = findCallTo(uniqueHandler, "dummy_function_handler")) {
+                                        existingHandler->eraseFromParent();
+                                    }
+                                    
+                                    IRBuilder<> endBuilder(uniqueTerminator);
+                                    endBuilder.CreateCall(endHandlerFunc);
+                                    errs() << "[+] Inserted dummy_function_VM_end_handler into BB: ";
+                                    uniqueHandler->printAsOperand(errs(), false);
+                                    errs() << "\n";
+                                    irModified = true;
                                 }
-                                
-                                IRBuilder<> endBuilder(uniqueHandler->getTerminator());
-                                endBuilder.CreateCall(endHandlerFunc);
-                                errs() << "[+] Inserted dummy_function_VM_end_handler into BB: ";
-                                uniqueHandler->printAsOperand(errs(), false);
-                                errs() << "\n";
-                                irModified = true;
                             }
                         }
                     }
@@ -244,7 +230,11 @@ public:
                                 BB.printAsOperand(errs(), false);
                                 errs() << "\n";
                                 irModified = true;
-                                break;
+                                // 한 번만 삽입하면 되므로 break (대부분의 경우 entry block 직후에 위치)
+                                // 하지만 loop-based obfuscation의 경우 여러 곳에 삽입될 수 있으므로, 
+                                // 'break'를 제거하고 모든 프리데세서에 삽입하는 것이 안전할 수 있습니다.
+                                // 현재는 원본 코드의 'break;'를 유지하겠습니다.
+                                break; 
                             }
                         }
                     }
@@ -273,7 +263,7 @@ extern "C" ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
             PB.registerPipelineParsingCallback(
                 PipelineParsingCallback(
                     [](StringRef Name, FunctionPassManager &FPM,
-                       ArrayRef<PassBuilder::PipelineElement>) {
+                        ArrayRef<PassBuilder::PipelineElement>) {
                         if (Name == "vmtag") { 
                             FPM.addPass(VMTagPass());
                             return true;
