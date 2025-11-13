@@ -159,11 +159,20 @@ public:
                         //     }
                         // }
                         
-                        if (!branchesToDispatcher) {
-                            IRBuilder<> handlerBuilder(handlerTerminator);
-                            handlerBuilder.CreateCall(standardHandlerFunc);
-                            errs() << "[+] Inserted dummy_function_handler call into BB: ";
-                            handler->printAsOperand(errs(), false);
+                        if (!branchesToDispatcher &&
+                            !findCallTo(uniqueHandler, "dummy_function_VM_end_handler") &&
+                            !isa<SwitchInst>(uniqueHandler->getTerminator()) &&
+                            (isa<BranchInst>(uniqueTerminator) && !cast<BranchInst>(uniqueTerminator)->isConditional())) {
+                                
+                                // 기존 dummy_function_handler가 있으면 제거
+                            if (CallInst *existingHandler = findCallTo(uniqueHandler, "dummy_function_handler")) {
+                                existingHandler->eraseFromParent();
+                            }
+
+                            IRBuilder<> endBuilder(uniqueHandler->getTerminator());
+                            endBuilder.CreateCall(endHandlerFunc);
+                            errs() << "[+] Inserted dummy_function_VM_end_handler into BB: ";
+                            uniqueHandler->printAsOperand(errs(), false);
                             errs() << "\n";
                             irModified = true;
                         }
