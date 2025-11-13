@@ -105,6 +105,12 @@ public:
                     // 이미 태그된 핸들러는 스킵
                     if (findCallTo(handler, "dummy_function_handler") || 
                         findCallTo(handler, "dummy_function_VM_end_handler")) {
+                        // 이미 태그된 경우에도 타겟 수집은 계속합니다.
+                        if (handlerTerminator) {
+                             for (unsigned i = 0; i < handlerTerminator->getNumSuccessors(); ++i) {
+                                handlerTargets[handler].insert(handlerTerminator->getSuccessor(i));
+                            }
+                        }
                         continue;
                     }
 
@@ -114,13 +120,20 @@ public:
                         for (unsigned i = 0; i < SI->getNumSuccessors(); ++i) {
                             BasicBlock *caseBlock = SI->getSuccessor(i);
                             
-                            // 중복 확인
-                            if (!findCallTo(caseBlock, "dummy_function_handler") &&
+                            // 중복 확인 및 Dispatcher가 아닌 경우에만 삽입
+                            if (caseBlock != dispatcherBlock &&
+                                !findCallTo(caseBlock, "dummy_function_handler") &&
                                 !findCallTo(caseBlock, "dummy_function_VM_end_handler")) {
                                 
-                                IRBuilder<> caseBuilder(caseBlock->getTerminator());
-                                caseBuilder.CreateCall(standardHandlerFunc);
-                                irModified = true;
+                                // 종료 명령어 직전에 삽입 (요청에 따라 수정)
+                                if (caseBlock->getTerminator()) {
+                                    IRBuilder<> caseBuilder(caseBlock->getTerminator());
+                                    caseBuilder.CreateCall(standardHandlerFunc);
+                                    errs() << "[+] Inserted dummy_function_handler call into BB: ";
+                                    caseBlock->printAsOperand(errs(), false);
+                                    errs() << " (Switch Successor)\n";
+                                    irModified = true;
+                                }
                             }
                         }
                         
@@ -133,29 +146,44 @@ public:
                     
                     // 일반 핸들러 처리
                     if (handlerTerminator) {
-                        // 핸들러의 분기 타겟 수집
-                        for (unsigned i = 0; i < handlerTerminator->getNumSuccessors(); ++i) {
-                            BasicBlock *target = handlerTerminator->getSuccessor(i);
-                            handlerTargets[handler].insert(target);
-                        }
                         
-                        // Dispatcher로 분기하지 않는 경우만 핸들러 태그 삽입
-                        bool branchesToDispatcher = false;
-                        // For loop to check if it branches to dispatcherBlock (kept commented out based on original code structure)
-                        // for (unsigned i = 0; i < handlerTerminator->getNumSuccessors(); ++i) {
-                        //     if (handlerTerminator->getSuccessor(i) == dispatcherBlock) {
-                        //         branchesToDispatcher = true;
-                        //         break;
-                        //     }
-                        // }
+                        // 현재 핸들러에 태그 삽입 (기존 로직 유지: 종료 명령어 직전)
+                        bool branchesToDispatcher = false; 
                         
                         if (!branchesToDispatcher) {
                             IRBuilder<> handlerBuilder(handlerTerminator);
                             handlerBuilder.CreateCall(standardHandlerFunc);
                             errs() << "[+] Inserted dummy_function_handler call into BB: ";
                             handler->printAsOperand(errs(), false);
-                            errs() << "\n";
+                            errs() << " (Itself)\n";
                             irModified = true;
+                        }
+                        
+                        // 핸들러의 분기 타겟 수집
+                        for (unsigned i = 0; i < handlerTerminator->getNumSuccessors(); ++i) {
+                            handlerTargets[handler].insert(handlerTerminator->getSuccessor(i));
+                        }
+                        
+                        // [새로운 로직] BranchInst인 경우 후행 블록에 태그 삽입
+                        if (isa<BranchInst>(handlerTerminator)) {
+                            for (unsigned i = 0; i < handlerTerminator->getNumSuccessors(); ++i) {
+                                BasicBlock *successor = handlerTerminator->getSuccessor(i);
+                                
+                                // 후행 블록이 Dispatcher 블록이 아니고, 이미 태그되지 않았으며, Terminator가 존재할 때만 삽입
+                                if (successor != dispatcherBlock && 
+                                    successor->getTerminator() && // Terminator가 존재하는지 확인
+                                    !findCallTo(successor, "dummy_function_handler") &&
+                                    !findCallTo(successor, "dummy_function_VM_end_handler")) 
+                                {
+                                    // 종료 명령어 직전에 삽입 (요청에 따라 수정)
+                                    IRBuilder<> successorBuilder(successor->getTerminator()); 
+                                    successorBuilder.CreateCall(standardHandlerFunc);
+                                    errs() << "[+] Inserted dummy_function_handler call into BB: ";
+                                    successor->printAsOperand(errs(), false);
+                                    errs() << " (Branch Successor)\n";
+                                    irModified = true;
+                                }
+                            }
                         }
                     }
                 }
@@ -230,10 +258,6 @@ public:
                                 BB.printAsOperand(errs(), false);
                                 errs() << "\n";
                                 irModified = true;
-                                // 한 번만 삽입하면 되므로 break (대부분의 경우 entry block 직후에 위치)
-                                // 하지만 loop-based obfuscation의 경우 여러 곳에 삽입될 수 있으므로, 
-                                // 'break'를 제거하고 모든 프리데세서에 삽입하는 것이 안전할 수 있습니다.
-                                // 현재는 원본 코드의 'break;'를 유지하겠습니다.
                                 break; 
                             }
                         }
