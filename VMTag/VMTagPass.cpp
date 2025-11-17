@@ -15,7 +15,11 @@ using namespace llvm;
 
 namespace {
 
-// 함수 콜이 이미 존재하는지 확인하고, CallInst가 있다면 반환
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+/// 특정 함수 호출이 블록에 이미 존재하는지 확인
 CallInst* findCallTo(BasicBlock *BB, StringRef FuncName) {
     for (Instruction &Inst : llvm::reverse(*BB)) {
         if (CallInst *CI = dyn_cast<CallInst>(&Inst)) {
@@ -23,7 +27,6 @@ CallInst* findCallTo(BasicBlock *BB, StringRef FuncName) {
                 return CI;
             }
         }
-        // Terminator는 CallInst가 아니므로 건너뜁니다.
         if (BB->getTerminator() == &Inst) {
             continue;
         }
@@ -31,7 +34,7 @@ CallInst* findCallTo(BasicBlock *BB, StringRef FuncName) {
     return nullptr;
 }
 
-// 선행 블록이 VM End Handler 호출을 포함하는지 확인하는 헬퍼 함수
+/// 선행 블록이 VM_end_handler 호출을 포함하는지 확인
 bool hasVMEndPredecessor(BasicBlock *BB) {
     for (BasicBlock *Pred : predecessors(BB)) {
         if (findCallTo(Pred, "dummy_function_VM_end_handler")) {
@@ -41,11 +44,11 @@ bool hasVMEndPredecessor(BasicBlock *BB) {
     return false;
 }
 
-// 블록에 terminator 외에 실제 명령어가 있는지 확인하는 헬퍼 함수
+/// 블록에 terminator 외에 실제 명령어가 있는지 확인
+/// dummy_function 호출은 제외하고 카운트
 bool hasNonTerminatorInstructions(BasicBlock *BB) {
     unsigned instCount = 0;
     for (Instruction &Inst : *BB) {
-        // dummy_function 호출은 제외하고 카운트
         if (CallInst *CI = dyn_cast<CallInst>(&Inst)) {
             if (CI->getCalledFunction()) {
                 StringRef funcName = CI->getCalledFunction()->getName();
@@ -60,8 +63,9 @@ bool hasNonTerminatorInstructions(BasicBlock *BB) {
     return instCount > 1;
 }
 
-// VM_end_handler 블록의 모든 후행자를 재귀적으로 수집하는 함수
-void collectAllSuccessors(BasicBlock *BB, std::set<BasicBlock*> &visited, std::set<BasicBlock*> &allSuccessors) {
+/// VM_end_handler 블록의 모든 후행자를 재귀적으로 수집
+void collectAllSuccessors(BasicBlock *BB, std::set<BasicBlock*> &visited, 
+                          std::set<BasicBlock*> &allSuccessors) {
     if (visited.count(BB)) {
         return;
     }
@@ -79,449 +83,491 @@ void collectAllSuccessors(BasicBlock *BB, std::set<BasicBlock*> &visited, std::s
     }
 }
 
+/// 조건 분기 이후의 모든 단일 분기 블록을 재귀적으로 탐색하여 태그 삽입
+/// - 조건 분기: 태그하지 않고 후행자 탐색
+/// - 단일 분기: 실제 로직이 있으면 태그하고 후행자 탐색 계속
+void tagConditionalBranchSuccessors(BasicBlock *BB, BasicBlock *dispatcherBlock,
+                                    FunctionCallee &handlerFunc,
+                                    std::set<BasicBlock*> &processedBlocks,
+                                    bool &irModified, int depth = 0) {
+    // 무한 재귀 방지 및 이미 처리된 블록 스킵
+    const int MAX_DEPTH = 20;
+    if (depth > MAX_DEPTH || processedBlocks.count(BB)) {
+        return;
+    }
+    processedBlocks.insert(BB);
+    
+    Instruction *terminator = BB->getTerminator();
+    if (!terminator) {
+        return;
+    }
+    
+    // Switch는 별도 처리하므로 여기서는 스킵
+    if (isa<SwitchInst>(terminator)) {
+        return;
+    }
+    
+    BranchInst *BI = dyn_cast<BranchInst>(terminator);
+    if (!BI) {
+        return;
+    }
+    
+    if (BI->isConditional()) {
+        // 조건 분기: 이 블록은 태그하지 않고 재귀 탐색 계속
+        for (unsigned i = 0; i < terminator->getNumSuccessors(); ++i) {
+            BasicBlock *successor = terminator->getSuccessor(i);
+            if (successor != dispatcherBlock) {
+                tagConditionalBranchSuccessors(successor, dispatcherBlock, handlerFunc, 
+                                               processedBlocks, irModified, depth + 1);
+            }
+        }
+    } else {
+        // 단일 분기: 실제 로직이 있으면 태그
+        if (BB != dispatcherBlock && 
+            !hasVMEndPredecessor(BB) &&
+            !findCallTo(BB, "dummy_function_handler") &&
+            !findCallTo(BB, "dummy_function_VM_end_handler") &&
+            hasNonTerminatorInstructions(BB)) {
+            
+            IRBuilder<> builder(terminator);
+            builder.CreateCall(handlerFunc);
+            errs() << "[+] Tagged handler: ";
+            BB->printAsOperand(errs(), false);
+            errs() << "\n";
+            irModified = true;
+        }
+        
+        // 단일 분기의 후행자도 계속 탐색 (dispatcher가 아닌 경우)
+        BasicBlock *successor = terminator->getSuccessor(0);
+        if (successor != dispatcherBlock) {
+            tagConditionalBranchSuccessors(successor, dispatcherBlock, handlerFunc, 
+                                           processedBlocks, irModified, depth + 1);
+        }
+    }
+}
+
+// ============================================================================
+// VMTagPass Implementation
+// ============================================================================
 
 class VMTagPass : public PassInfoMixin<VMTagPass> {
 public:
     PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM) {
-        
         if (F.isDeclaration()) {
             return PreservedAnalyses::all();
         }
 
-        errs() << "[*] Analyzing function: '" << F.getName() << "'\n";
+        // main 함수만 처리
+        if (F.getName() != "main") {
+            return PreservedAnalyses::all();
+        }
+
+        errs() << "\n[*] Analyzing function: '" << F.getName() << "'\n";
+        errs() << "========================================\n";
+        
         bool irModified = false;
         LLVMContext &Ctx = F.getContext();
         Module *M = F.getParent();
-        
-        // 함수가 main일 때
-        if (F.getName() == "main") {
-            errs() << "--- Main Function Modification ---\n";
 
-            // 후행자 개수 찾기 및 succCandidate (dispatcher) 결정
-            std::map<const BasicBlock*, unsigned> successorCounts;
-            for (BasicBlock &BB : F) {
-                const Instruction *terminator = BB.getTerminator();
-                unsigned numSuccessors = terminator ? terminator->getNumSuccessors() : 0;
-                successorCounts[&BB] = numSuccessors;
-            }
-
-            const BasicBlock *succCandidate = nullptr;
-            unsigned maxSuccs = 0;
-            for (auto const& [block, count] : successorCounts) {
-                if (count > maxSuccs) {
-                    maxSuccs = count;
-                    succCandidate = block;
-                }
-            }
-            
-            // Dispatcher/Handler Tagging
-            if (succCandidate) {
-                // Dispatcher 블록에 dummy_function_dispatch_start 삽입
-                FunctionType *dispatchFuncType = FunctionType::get(Type::getVoidTy(Ctx), false);
-                FunctionCallee dispatchFunc = M->getOrInsertFunction("dummy_function_dispatch_start", dispatchFuncType);
-
-                BasicBlock *dispatcherBlock = const_cast<BasicBlock*>(succCandidate);
-                if (!findCallTo(dispatcherBlock, "dummy_function_dispatch_start")) {
-                    IRBuilder<> dispatchBuilder(dispatcherBlock->getTerminator());
-                    dispatchBuilder.CreateCall(dispatchFunc);
-                    errs() << "[+] Inserted dummy_function_dispatch_start call into BB: ";
-                    dispatcherBlock->printAsOperand(errs(), false);
-                    errs() << "\n";
-                    irModified = true;
-                }
-                
-                // Dispatcher의 후행 블럭들(핸들러들) 수집
-                Instruction *dispatcherTerminator = dispatcherBlock->getTerminator();
-                std::vector<BasicBlock*> handlers;
-                
-                if (dispatcherTerminator) {
-                    for (unsigned i = 0; i < dispatcherTerminator->getNumSuccessors(); ++i) {
-                        handlers.push_back(dispatcherTerminator->getSuccessor(i));
-                    }
-                }
-
-                FunctionType *handlerFuncType = FunctionType::get(Type::getVoidTy(Ctx), false);
-                FunctionCallee standardHandlerFunc = M->getOrInsertFunction("dummy_function_handler", handlerFuncType);
-                FunctionCallee endHandlerFunc = M->getOrInsertFunction("dummy_function_VM_end_handler", handlerFuncType);
-
-                // 각 핸들러의 종료 명령어 타겟을 수집 (VM_end_handler 후보 찾기 위함)
-                std::map<BasicBlock*, std::set<BasicBlock*>> handlerTargets;
-                
-                // 조건 분기 핸들러의 합류 지점을 추적
-                std::set<BasicBlock*> conditionalBranchConvergencePoints;
-                
-                // VM_end_handler 블록을 추적
-                BasicBlock *vmEndHandlerBlock = nullptr;
-                
-                for (BasicBlock *handler : handlers) {
-                    Instruction *handlerTerminator = handler->getTerminator();
-                    
-                    // 이미 태그된 핸들러는 스킵 (타겟 수집은 계속)
-                    if (findCallTo(handler, "dummy_function_handler") || 
-                        findCallTo(handler, "dummy_function_VM_end_handler")) {
-                        if (handlerTerminator) {
-                             for (unsigned i = 0; i < handlerTerminator->getNumSuccessors(); ++i) {
-                                handlerTargets[handler].insert(handlerTerminator->getSuccessor(i));
-                            }
-                        }
-                        continue;
-                    }
-
-                    // Switch 명령어 처리
-                    if (SwitchInst *SI = dyn_cast<SwitchInst>(handlerTerminator)) {
-                        // Switch의 각 case 블록에 handler 태그 삽입
-                        for (unsigned i = 0; i < SI->getNumSuccessors(); ++i) {
-                            BasicBlock *caseBlock = SI->getSuccessor(i);
-                            Instruction *caseTerminator = caseBlock->getTerminator();
-
-                            // 선행자 개수 확인
-                            unsigned numPredecessors = 0;
-                            for (BasicBlock *Pred : predecessors(caseBlock)) {
-                                numPredecessors++;
-                            }
-
-                            // 1. 기본 조건 검사
-                            if (caseBlock != dispatcherBlock &&
-                                caseTerminator &&
-                                !hasVMEndPredecessor(caseBlock) &&
-                                !findCallTo(caseBlock, "dummy_function_handler") &&
-                                !findCallTo(caseBlock, "dummy_function_VM_end_handler") &&
-                                hasNonTerminatorInstructions(caseBlock)) {
-                                
-                                // 2. 합류 지점 필터링
-                                bool isConvergencePoint = false;
-                                if (numPredecessors >= 2) {
-                                    for (unsigned j = 0; j < caseTerminator->getNumSuccessors(); ++j) {
-                                        if (caseTerminator->getSuccessor(j) == dispatcherBlock) {
-                                            isConvergencePoint = true;
-                                            errs() << "[*] Skipping convergence point BB: ";
-                                            caseBlock->printAsOperand(errs(), false);
-                                            errs() << " (predecessors: " << numPredecessors << ", Switch case)\n";
-                                            break;
-                                        }
-                                    }
-                                }
-                                
-                                if (isConvergencePoint) {
-                                    continue;
-                                }
-                                
-                                // 3. Dispatcher로 분기하는지 확인
-                                bool branchesToDispatcher = false;
-                                for (unsigned j = 0; j < caseTerminator->getNumSuccessors(); ++j) {
-                                    if (caseTerminator->getSuccessor(j) == dispatcherBlock) {
-                                        branchesToDispatcher = true;
-                                        break;
-                                    }
-                                }
-
-                                if (branchesToDispatcher) {
-                                    // 종료 명령어 직전에 삽입
-                                    IRBuilder<> caseBuilder(caseTerminator);
-                                    caseBuilder.CreateCall(standardHandlerFunc);
-                                    errs() << "[+] Inserted dummy_function_handler call into BB: ";
-                                    caseBlock->printAsOperand(errs(), false);
-                                    errs() << " (Switch Successor)\n";
-                                    irModified = true;
-                                }
-                            }
-                        }
-                        
-                        // Switch 핸들러 자체는 타겟 수집만
-                        for (unsigned i = 0; i < SI->getNumSuccessors(); ++i) {
-                            handlerTargets[handler].insert(SI->getSuccessor(i));
-                        }
-                        continue;
-                    }
-                    
-                    // 일반 핸들러 처리
-                    if (handlerTerminator) {
-                        
-                        // 현재 핸들러에 태그 삽입 (종료 명령어 직전)
-                        bool branchesToDispatcher = false; 
-                        
-                        // terminator만 있는 블록은 스킵
-                        if (!branchesToDispatcher && !hasVMEndPredecessor(handler) && hasNonTerminatorInstructions(handler)) {
-                            IRBuilder<> handlerBuilder(handlerTerminator);
-                            handlerBuilder.CreateCall(standardHandlerFunc);
-                            errs() << "[+] Inserted dummy_function_handler call into BB: ";
-                            handler->printAsOperand(errs(), false);
-                            errs() << " (Itself)\n";
-                            irModified = true;
-                        } else if (!hasNonTerminatorInstructions(handler)) {
-                            errs() << "[*] Skipping BB with only terminator: ";
-                            handler->printAsOperand(errs(), false);
-                            errs() << "\n";
-                        }
-                        
-                        // 핸들러의 분기 타겟 수집
-                        for (unsigned i = 0; i < handlerTerminator->getNumSuccessors(); ++i) {
-                            handlerTargets[handler].insert(handlerTerminator->getSuccessor(i));
-                        }
-                        
-                        // BranchInst인 경우 후행 블록에 태그 삽입
-                        if (BranchInst *BI = dyn_cast<BranchInst>(handlerTerminator)) {
-                            // 조건 분기인지 확인
-                            bool isConditionalBranch = BI->isConditional();
-                            
-                            // 조건 분기인 경우, 두 후행자의 합류 지점을 기록
-                            if (isConditionalBranch && handlerTerminator->getNumSuccessors() == 2) {
-                                BasicBlock *succ0 = handlerTerminator->getSuccessor(0);
-                                BasicBlock *succ1 = handlerTerminator->getSuccessor(1);
-                                
-                                // 두 후행자의 공통 후행자 찾기
-                                std::set<BasicBlock*> succ0Successors;
-                                if (Instruction *succ0Term = succ0->getTerminator()) {
-                                    for (unsigned k = 0; k < succ0Term->getNumSuccessors(); ++k) {
-                                        succ0Successors.insert(succ0Term->getSuccessor(k));
-                                    }
-                                }
-                                
-                                if (Instruction *succ1Term = succ1->getTerminator()) {
-                                    for (unsigned k = 0; k < succ1Term->getNumSuccessors(); ++k) {
-                                        BasicBlock *succ1Succ = succ1Term->getSuccessor(k);
-                                        if (succ0Successors.count(succ1Succ)) {
-                                            conditionalBranchConvergencePoints.insert(succ1Succ);
-                                            errs() << "[*] Detected conditional branch convergence point: ";
-                                            succ1Succ->printAsOperand(errs(), false);
-                                            errs() << "\n";
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            for (unsigned i = 0; i < handlerTerminator->getNumSuccessors(); ++i) {
-                                BasicBlock *successor = handlerTerminator->getSuccessor(i);
-                                Instruction *successorTerminator = successor->getTerminator();
-                                
-                                // 선행자 개수 확인
-                                unsigned numPredecessors = 0;
-                                for (BasicBlock *Pred : predecessors(successor)) {
-                                    numPredecessors++;
-                                }
-                                
-                                // 1. 기본 조건 검사
-                                if (successor != dispatcherBlock && 
-                                    successorTerminator &&
-                                    !hasVMEndPredecessor(successor) &&
-                                    !findCallTo(successor, "dummy_function_handler") &&
-                                    !findCallTo(successor, "dummy_function_VM_end_handler") &&
-                                    hasNonTerminatorInstructions(successor)) 
-                                {
-                                    // 2. 합류 지점 필터링 (선행자가 2개 이상이고 dispatcher로 직접 분기)
-                                    bool isConvergencePoint = false;
-                                    if (numPredecessors >= 2) {
-                                        for (unsigned j = 0; j < successorTerminator->getNumSuccessors(); ++j) {
-                                            if (successorTerminator->getSuccessor(j) == dispatcherBlock) {
-                                                isConvergencePoint = true;
-                                                errs() << "[*] Skipping convergence point BB: ";
-                                                successor->printAsOperand(errs(), false);
-                                                errs() << " (predecessors: " << numPredecessors << ")\n";
-                                                break;
-                                            }
-                                        }
-                                    }
-                                    
-                                    if (isConvergencePoint) {
-                                        continue;
-                                    }
-                                    
-                                    // 3. 분기 조건 확인
-                                    bool shouldTag = false;
-                                    
-                                    if (isConditionalBranch) {
-                                        // 조건 분기의 경우: 항상 태그 추가
-                                        shouldTag = true;
-                                        errs() << "[*] Found conditional branch handler. Tagging successor: ";
-                                        successor->printAsOperand(errs(), false);
-                                        errs() << "\n";
-                                    } else {
-                                        // 무조건 분기의 경우: dispatcher로 분기하는 경우에만 태그 추가
-                                        for (unsigned j = 0; j < successorTerminator->getNumSuccessors(); ++j) {
-                                            if (successorTerminator->getSuccessor(j) == dispatcherBlock) {
-                                                shouldTag = true;
-                                                break;
-                                            }
-                                        }
-                                    }
-
-                                    if (shouldTag) {
-                                        IRBuilder<> successorBuilder(successorTerminator); 
-                                        successorBuilder.CreateCall(standardHandlerFunc);
-                                        errs() << "[+] Inserted dummy_function_handler call into BB: ";
-                                        successor->printAsOperand(errs(), false);
-                                        errs() << " (Branch Successor - ";
-                                        errs() << (isConditionalBranch ? "Conditional" : "Unconditional");
-                                        errs() << ")\n";
-                                        irModified = true;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // 조건 분기의 합류 지점에 handler 태그 추가
-                for (BasicBlock *convergencePoint : conditionalBranchConvergencePoints) {
-                    if (convergencePoint != dispatcherBlock &&
-                        !findCallTo(convergencePoint, "dummy_function_handler") &&
-                        !findCallTo(convergencePoint, "dummy_function_VM_end_handler") &&
-                        hasNonTerminatorInstructions(convergencePoint)) {
-                        
-                        Instruction *convergenceTerminator = convergencePoint->getTerminator();
-                        if (convergenceTerminator) {
-                            IRBuilder<> convergenceBuilder(convergenceTerminator);
-                            convergenceBuilder.CreateCall(standardHandlerFunc);
-                            errs() << "[+] Inserted dummy_function_handler call into convergence point BB: ";
-                            convergencePoint->printAsOperand(errs(), false);
-                            errs() << "\n";
-                            irModified = true;
-                        }
-                    }
-                }
-
-                // VM_end_handler 후보 찾기: 다른 핸들러들과 다른 곳으로 분기하는 핸들러
-                if (handlerTargets.size() > 1) {
-                    std::map<std::set<BasicBlock*>, std::vector<BasicBlock*>> targetGroups;
-                    
-                    for (auto &[handler, targets] : handlerTargets) {
-                        targetGroups[targets].push_back(handler);
-                    }
-                    
-                    // 혼자 다른 곳으로 분기하는 핸들러 찾기
-                    for (auto &[targets, handlersWithSameTargets] : targetGroups) {
-                        if (handlersWithSameTargets.size() == 1) {
-                            BasicBlock *uniqueHandler = handlersWithSameTargets[0];
-                            
-                            // dispatcher로 분기하는지 확인
-                            bool branchesToDispatcher = false;
-                            Instruction *uniqueTerminator = uniqueHandler->getTerminator();
-                            if (uniqueTerminator) {
-                                for (unsigned i = 0; i < uniqueTerminator->getNumSuccessors(); ++i) {
-                                    if (uniqueTerminator->getSuccessor(i) == dispatcherBlock) {
-                                        branchesToDispatcher = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            
-                            // VM_end_handler 삽입 조건
-                            if (!branchesToDispatcher &&
-                                !findCallTo(uniqueHandler, "dummy_function_VM_end_handler") &&
-                                !isa<SwitchInst>(uniqueTerminator)) 
-                            {
-                                // 단일 분기(Unconditional Branch) 여부 최종 확인
-                                if (uniqueTerminator && isa<BranchInst>(uniqueTerminator) && !cast<BranchInst>(uniqueTerminator)->isConditional()) {
-                                    
-                                    // 기존 dummy_function_handler가 있으면 제거
-                                    if (CallInst *existingHandler = findCallTo(uniqueHandler, "dummy_function_handler")) {
-                                        existingHandler->eraseFromParent();
-                                    }
-                                    
-                                    IRBuilder<> endBuilder(uniqueTerminator);
-                                    endBuilder.CreateCall(endHandlerFunc);
-                                    errs() << "[+] Inserted dummy_function_VM_end_handler into BB: ";
-                                    uniqueHandler->printAsOperand(errs(), false);
-                                    errs() << "\n";
-                                    irModified = true;
-                                    
-                                    // VM_end_handler 블록 저장
-                                    vmEndHandlerBlock = uniqueHandler;
-                                }
-                            }
-                        }
-                    }
-                }
-                
-                // VM_start 삽입: dispatcher 직전 블록에 삽입
-                FunctionType *startFuncType = FunctionType::get(Type::getVoidTy(Ctx), false);
-                FunctionCallee startFunc = M->getOrInsertFunction("dummy_function_VM_start", startFuncType);
-                
-                for (BasicBlock &BB : F) {
-                    Instruction *terminator = BB.getTerminator();
-                    // terminator가 존재하고, successor가 있는지 확인
-                    if (terminator && terminator->getNumSuccessors() > 0) {
-                        // 첫 번째 successor가 dispatcher인지 확인
-                        if (terminator->getSuccessor(0) == dispatcherBlock) {
-                            // 중복 방지
-                            if (!findCallTo(&BB, "dummy_function_VM_start")) {
-                                // terminator 직전에 삽입
-                                IRBuilder<> startBuilder(terminator);
-                                startBuilder.CreateCall(startFunc);
-                                errs() << "[+] Inserted dummy_function_VM_start call into BB: ";
-                                BB.printAsOperand(errs(), false);
-                                errs() << "\n";
-                                irModified = true;
-                                break; 
-                            }
-                        }
-                    }
-                }
-                
-                // VM_end_handler 이후의 모든 블록에 NonVM 태그 삽입
-                if (vmEndHandlerBlock) {
-                    errs() << "--- Tagging Non-VM Region ---\n";
-                    
-                    FunctionType *nonVMFuncType = FunctionType::get(Type::getVoidTy(Ctx), false);
-                    FunctionCallee nonVMFunc = M->getOrInsertFunction("dummy_function_NonVM", nonVMFuncType);
-                    
-                    std::set<BasicBlock*> visited;
-                    std::set<BasicBlock*> nonVMBlocks;
-                    
-                    // VM_end_handler 블록의 모든 후행자를 재귀적으로 수집
-                    collectAllSuccessors(vmEndHandlerBlock, visited, nonVMBlocks);
-                    
-                    errs() << "[*] Found " << nonVMBlocks.size() << " blocks after VM_end_handler\n";
-                    
-                    // 각 NonVM 블록에 태그 삽입
-                    for (BasicBlock *nonVMBlock : nonVMBlocks) {
-                        // 이미 NonVM 태그가 있으면 스킵
-                        if (findCallTo(nonVMBlock, "dummy_function_NonVM")) {
-                            continue;
-                        }
-                        
-                        Instruction *nonVMTerminator = nonVMBlock->getTerminator();
-                        if (nonVMTerminator) {
-                            IRBuilder<> nonVMBuilder(nonVMTerminator);
-                            nonVMBuilder.CreateCall(nonVMFunc);
-                            errs() << "[+] Inserted dummy_function_NonVM call into BB: ";
-                            nonVMBlock->printAsOperand(errs(), false);
-                            errs() << "\n";
-                            irModified = true;
-                        }
-                    }
-                }
-                
-            } else {
-                errs() << "-> No candidate blocks found for dispatcher\n";
-            }
+        // Dispatcher 찾기: 가장 많은 후행자를 가진 블록
+        BasicBlock *dispatcherBlock = findDispatcher(F);
+        if (!dispatcherBlock) {
+            errs() << "[-] No dispatcher block found\n";
+            errs() << "========================================\n\n";
+            return PreservedAnalyses::all();
         }
-        
-        errs() << "----------------------------------------\n";
+
+        errs() << "[+] Found dispatcher block: ";
+        dispatcherBlock->printAsOperand(errs(), false);
+        errs() << "\n\n";
+
+        // 함수 선언 준비
+        FunctionType *voidFuncType = FunctionType::get(Type::getVoidTy(Ctx), false);
+        FunctionCallee dispatchFunc = M->getOrInsertFunction("dummy_function_dispatch_start", voidFuncType);
+        FunctionCallee handlerFunc = M->getOrInsertFunction("dummy_function_handler", voidFuncType);
+        FunctionCallee endHandlerFunc = M->getOrInsertFunction("dummy_function_VM_end_handler", voidFuncType);
+        FunctionCallee startFunc = M->getOrInsertFunction("dummy_function_VM_start", voidFuncType);
+        FunctionCallee nonVMFunc = M->getOrInsertFunction("dummy_function_NonVM", voidFuncType);
+
+        // 1. Dispatcher 태그
+        tagDispatcher(dispatcherBlock, dispatchFunc, irModified);
+
+        // 2. Handlers 수집 및 태그
+        std::vector<BasicBlock*> handlers = getHandlers(dispatcherBlock);
+        std::map<BasicBlock*, std::set<BasicBlock*>> handlerTargets;
+        std::set<BasicBlock*> processedBlocks;
+
+        tagHandlers(handlers, dispatcherBlock, handlerFunc, handlerTargets, 
+                   processedBlocks, irModified);
+
+        // 3. VM_end_handler 찾기 및 태그
+        BasicBlock *vmEndHandlerBlock = findAndTagVMEndHandler(
+            handlers, dispatcherBlock, handlerTargets, handlerFunc, endHandlerFunc, irModified);
+
+        // 4. VM_start 태그
+        tagVMStart(F, dispatcherBlock, startFunc, irModified);
+
+        // 5. NonVM 영역 태그
+        if (vmEndHandlerBlock) {
+            tagNonVMRegion(vmEndHandlerBlock, nonVMFunc, irModified);
+        }
+
+        errs() << "========================================\n";
+        errs() << "[*] IR Modified: " << (irModified ? "Yes" : "No") << "\n\n";
         
         return irModified ? PreservedAnalyses::none() : PreservedAnalyses::all();
     }
+
+private:
+    /// 가장 많은 후행자를 가진 블록을 dispatcher로 식별
+    BasicBlock* findDispatcher(Function &F) {
+        const BasicBlock *candidate = nullptr;
+        unsigned maxSuccs = 0;
+
+        for (BasicBlock &BB : F) {
+            const Instruction *terminator = BB.getTerminator();
+            unsigned numSuccessors = terminator ? terminator->getNumSuccessors() : 0;
+            
+            if (numSuccessors > maxSuccs) {
+                maxSuccs = numSuccessors;
+                candidate = &BB;
+            }
+        }
+
+        return const_cast<BasicBlock*>(candidate);
+    }
+
+    /// Dispatcher 블록에 태그 삽입
+    void tagDispatcher(BasicBlock *dispatcher, FunctionCallee &dispatchFunc, bool &irModified) {
+        if (!findCallTo(dispatcher, "dummy_function_dispatch_start")) {
+            IRBuilder<> builder(dispatcher->getTerminator());
+            builder.CreateCall(dispatchFunc);
+            errs() << "[+] Tagged dispatcher\n";
+            irModified = true;
+        }
+    }
+
+    /// Dispatcher의 직접 후행자들(handlers) 수집
+    std::vector<BasicBlock*> getHandlers(BasicBlock *dispatcher) {
+        std::vector<BasicBlock*> handlers;
+        Instruction *terminator = dispatcher->getTerminator();
+        
+        if (terminator) {
+            for (unsigned i = 0; i < terminator->getNumSuccessors(); ++i) {
+                handlers.push_back(terminator->getSuccessor(i));
+            }
+        }
+
+        errs() << "[*] Found " << handlers.size() << " handler(s)\n\n";
+        return handlers;
+    }
+
+    /// Handler 블록들 태그
+    void tagHandlers(std::vector<BasicBlock*> &handlers, BasicBlock *dispatcher,
+                    FunctionCallee &handlerFunc, 
+                    std::map<BasicBlock*, std::set<BasicBlock*>> &handlerTargets,
+                    std::set<BasicBlock*> &processedBlocks, bool &irModified) {
+        
+        errs() << "--- Tagging Handlers ---\n";
+
+        for (BasicBlock *handler : handlers) {
+            Instruction *terminator = handler->getTerminator();
+            
+            // 이미 태그된 핸들러는 타겟만 수집
+            if (findCallTo(handler, "dummy_function_handler") || 
+                findCallTo(handler, "dummy_function_VM_end_handler")) {
+                collectTargets(handler, terminator, handlerTargets);
+                continue;
+            }
+
+            // Switch 명령어 처리
+            if (SwitchInst *SI = dyn_cast<SwitchInst>(terminator)) {
+                tagSwitchHandler(SI, handler, dispatcher, handlerFunc, 
+                               handlerTargets, irModified);
+                continue;
+            }
+
+            // Branch 명령어 처리
+            if (terminator) {
+                collectTargets(handler, terminator, handlerTargets);
+                tagBranchHandler(handler, dispatcher, terminator, handlerFunc, 
+                               processedBlocks, irModified);
+            }
+        }
+
+        errs() << "\n";
+    }
+
+    /// 타겟 수집
+    void collectTargets(BasicBlock *handler, Instruction *terminator,
+                       std::map<BasicBlock*, std::set<BasicBlock*>> &handlerTargets) {
+        if (terminator) {
+            for (unsigned i = 0; i < terminator->getNumSuccessors(); ++i) {
+                handlerTargets[handler].insert(terminator->getSuccessor(i));
+            }
+        }
+    }
+
+    /// Switch 핸들러 처리
+    void tagSwitchHandler(SwitchInst *SI, BasicBlock *handler, BasicBlock *dispatcher,
+                         FunctionCallee &handlerFunc,
+                         std::map<BasicBlock*, std::set<BasicBlock*>> &handlerTargets,
+                         bool &irModified) {
+        
+        // Switch 블록 자체는 태그하지 않고, 각 case 블록에 태그
+        for (unsigned i = 0; i < SI->getNumSuccessors(); ++i) {
+            BasicBlock *caseBlock = SI->getSuccessor(i);
+            Instruction *caseTerminator = caseBlock->getTerminator();
+
+            if (caseBlock != dispatcher &&
+                caseTerminator &&
+                !hasVMEndPredecessor(caseBlock) &&
+                !findCallTo(caseBlock, "dummy_function_handler") &&
+                !findCallTo(caseBlock, "dummy_function_VM_end_handler") &&
+                hasNonTerminatorInstructions(caseBlock)) {
+                
+                IRBuilder<> builder(caseTerminator);
+                builder.CreateCall(handlerFunc);
+                errs() << "[+] Tagged handler: ";
+                caseBlock->printAsOperand(errs(), false);
+                errs() << "\n";
+                irModified = true;
+            }
+        }
+
+        // 타겟 수집
+        for (unsigned i = 0; i < SI->getNumSuccessors(); ++i) {
+            handlerTargets[handler].insert(SI->getSuccessor(i));
+        }
+    }
+
+    /// Branch 핸들러 처리
+    void tagBranchHandler(BasicBlock *handler, BasicBlock *dispatcher, 
+                         Instruction *terminator, FunctionCallee &handlerFunc,
+                         std::set<BasicBlock*> &processedBlocks, bool &irModified) {
+        
+        BranchInst *BI = dyn_cast<BranchInst>(terminator);
+        if (!BI) {
+            return;
+        }
+
+        if (BI->isConditional()) {
+            // 조건 분기: 핸들러 자체는 태그하지 않고 재귀 탐색
+            for (unsigned i = 0; i < terminator->getNumSuccessors(); ++i) {
+                BasicBlock *successor = terminator->getSuccessor(i);
+                if (successor != dispatcher) {
+                    tagConditionalBranchSuccessors(successor, dispatcher, handlerFunc, 
+                                                   processedBlocks, irModified, 0);
+                }
+            }
+        } else {
+            // 단일 분기: 핸들러 자체에 태그
+            if (!hasVMEndPredecessor(handler) && hasNonTerminatorInstructions(handler)) {
+                IRBuilder<> builder(terminator);
+                builder.CreateCall(handlerFunc);
+                errs() << "[+] Tagged handler: ";
+                handler->printAsOperand(errs(), false);
+                errs() << "\n";
+                irModified = true;
+            }
+        }
+    }
+
+    /// VM_end_handler 찾기 및 태그
+    BasicBlock* findAndTagVMEndHandler(std::vector<BasicBlock*> &handlers,
+                                       BasicBlock *dispatcher,
+                                       std::map<BasicBlock*, std::set<BasicBlock*>> &handlerTargets,
+                                       FunctionCallee &handlerFunc,
+                                       FunctionCallee &endHandlerFunc,
+                                       bool &irModified) {
+        
+        errs() << "--- Finding VM End Handler ---\n";
+        BasicBlock *vmEndHandlerBlock = nullptr;
+
+        // 1. 고유한 분기 타겟을 가진 핸들러 찾기
+        if (handlerTargets.size() > 1) {
+            vmEndHandlerBlock = findUniqueTargetHandler(
+                handlerTargets, dispatcher, handlerFunc, endHandlerFunc, irModified);
+        }
+
+        // 2. ret 명령어를 가진 핸들러 찾기
+        if (!vmEndHandlerBlock) {
+            vmEndHandlerBlock = findReturnHandler(
+                handlers, handlerFunc, endHandlerFunc, irModified);
+        }
+
+        if (vmEndHandlerBlock) {
+            errs() << "[+] Tagged VM_end_handler at BB: ";
+            vmEndHandlerBlock->printAsOperand(errs(), false);
+            errs() << "\n\n";
+        } else {
+            errs() << "[-] No VM end handler found\n\n";
+        }
+
+        return vmEndHandlerBlock;
+    }
+
+    /// 고유한 분기 타겟을 가진 핸들러 찾기
+    BasicBlock* findUniqueTargetHandler(std::map<BasicBlock*, std::set<BasicBlock*>> &handlerTargets,
+                                        BasicBlock *dispatcher,
+                                        FunctionCallee &handlerFunc,
+                                        FunctionCallee &endHandlerFunc,
+                                        bool &irModified) {
+        
+        std::map<std::set<BasicBlock*>, std::vector<BasicBlock*>> targetGroups;
+        
+        for (auto &[handler, targets] : handlerTargets) {
+            targetGroups[targets].push_back(handler);
+        }
+
+        for (auto &[targets, handlersWithSameTargets] : targetGroups) {
+            if (handlersWithSameTargets.size() == 1) {
+                BasicBlock *uniqueHandler = handlersWithSameTargets[0];
+                Instruction *terminator = uniqueHandler->getTerminator();
+
+                // dispatcher로 분기하는지 확인
+                bool branchesToDispatcher = false;
+                if (terminator) {
+                    for (unsigned i = 0; i < terminator->getNumSuccessors(); ++i) {
+                        if (terminator->getSuccessor(i) == dispatcher) {
+                            branchesToDispatcher = true;
+                            break;
+                        }
+                    }
+                }
+
+                // VM_end_handler 조건 확인
+                if (!branchesToDispatcher &&
+                    !findCallTo(uniqueHandler, "dummy_function_VM_end_handler") &&
+                    !isa<SwitchInst>(terminator) &&
+                    terminator && isa<BranchInst>(terminator) &&
+                    !cast<BranchInst>(terminator)->isConditional()) {
+                    
+                    // 기존 handler 태그 제거 후 end_handler 태그 삽입
+                    if (CallInst *existingHandler = findCallTo(uniqueHandler, "dummy_function_handler")) {
+                        existingHandler->eraseFromParent();
+                    }
+                    
+                    IRBuilder<> builder(terminator);
+                    builder.CreateCall(endHandlerFunc);
+                    // errs() << "[+] Tagged VM_end_handler\n";
+                    irModified = true;
+                    
+                    return uniqueHandler;
+                }
+            }
+        }
+
+        return nullptr;
+    }
+
+    /// Return 명령어를 가진 핸들러 찾기
+    BasicBlock* findReturnHandler(std::vector<BasicBlock*> &handlers,
+                                  FunctionCallee &handlerFunc,
+                                  FunctionCallee &endHandlerFunc,
+                                  bool &irModified) {
+        
+        for (BasicBlock *handler : handlers) {
+            Instruction *terminator = handler->getTerminator();
+            
+            if (terminator && isa<ReturnInst>(terminator)) {
+                if (!findCallTo(handler, "dummy_function_VM_end_handler")) {
+                    // 기존 handler 태그 제거 후 end_handler 태그 삽입
+                    if (CallInst *existingHandler = findCallTo(handler, "dummy_function_handler")) {
+                        existingHandler->eraseFromParent();
+                    }
+                    
+                    IRBuilder<> builder(terminator);
+                    builder.CreateCall(endHandlerFunc);
+                    errs() << "[+] Tagged VM_end_handler (return instruction)\n";
+                    irModified = true;
+                    
+                    return handler;
+                }
+            }
+        }
+
+        return nullptr;
+    }
+
+    /// VM_start 태그 (dispatcher 직전 블록)
+    void tagVMStart(Function &F, BasicBlock *dispatcher, 
+                   FunctionCallee &startFunc, bool &irModified) {
+        
+        errs() << "--- Tagging VM Start ---\n";
+
+        for (BasicBlock &BB : F) {
+            Instruction *terminator = BB.getTerminator();
+            
+            if (terminator && terminator->getNumSuccessors() > 0) {
+                if (terminator->getSuccessor(0) == dispatcher) {
+                    if (!findCallTo(&BB, "dummy_function_VM_start")) {
+                        IRBuilder<> builder(terminator);
+                        builder.CreateCall(startFunc);
+                        errs() << "[+] Tagged VM_start at BB: ";
+                        BB.printAsOperand(errs(), false);
+                        errs() << "\n\n";
+                        irModified = true;
+                        return;
+                    }
+                }
+            }
+        }
+
+        errs() << "[-] No VM_start location found\n\n";
+    }
+
+    /// NonVM 영역 태그 (VM_end_handler 이후)
+    void tagNonVMRegion(BasicBlock *vmEndHandler, FunctionCallee &nonVMFunc, 
+                       bool &irModified) {
+        
+        errs() << "--- Tagging Non-VM Region ---\n";
+
+        std::set<BasicBlock*> visited;
+        std::set<BasicBlock*> nonVMBlocks;
+        
+        collectAllSuccessors(vmEndHandler, visited, nonVMBlocks);
+        
+        // errs() << "[*] Found " << nonVMBlocks.size() << " non-VM block(s)\n";
+
+        for (BasicBlock *nonVMBlock : nonVMBlocks) {
+            if (findCallTo(nonVMBlock, "dummy_function_NonVM")) {
+                continue;
+            }
+            
+            Instruction *terminator = nonVMBlock->getTerminator();
+            if (terminator) {
+                IRBuilder<> builder(terminator);
+                builder.CreateCall(nonVMFunc);
+                irModified = true;
+            }
+        }
+
+        errs() << "[+] Tagged " << nonVMBlocks.size() << " non-VM blocks\n\n";
+    }
 };
 
-}
+} // anonymous namespace
+
+// ============================================================================
+// Pass Registration
+// ============================================================================
 
 extern "C" ::llvm::PassPluginLibraryInfo llvmGetPassPluginInfo() {
     return {
         LLVM_PLUGIN_API_VERSION,
-        "VMTagPass", "v0.1",
+        "VMTagPass",
+        "v0.2",
         [](PassBuilder &PB) {
-            using PipelineParsingCallback = std::function<bool(StringRef, FunctionPassManager &, ArrayRef<PassBuilder::PipelineElement>)>;
-
             PB.registerPipelineParsingCallback(
-                PipelineParsingCallback(
-                    [](StringRef Name, FunctionPassManager &FPM,
-                        ArrayRef<PassBuilder::PipelineElement>) {
-                        if (Name == "vmtag") { 
-                            FPM.addPass(VMTagPass());
-                            return true;
-                        }
-                        return false;
-                    })
+                [](StringRef Name, FunctionPassManager &FPM,
+                   ArrayRef<PassBuilder::PipelineElement>) {
+                    if (Name == "vmtag") {
+                        FPM.addPass(VMTagPass());
+                        return true;
+                    }
+                    return false;
+                }
             );
         }
     };
