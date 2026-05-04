@@ -1,0 +1,9 @@
+# Build
+cd llvm-project/build
+
+cmake -G Ninja ../llvm \
+  -DLLVM_ENABLE_PROJECTS=clang \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLLVM_TARGETS_TO_BUILD=host
+
+ninja [PassDirectory]

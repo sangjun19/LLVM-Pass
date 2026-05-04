@@ -18,7 +18,7 @@ namespace {
 
       PreservedAnalyses run (Module &M, ModuleAnalysisManager &) {
         errs() << "202650291 안상준" << "\n";
-        errs() << "=============================\n";
+        errs() << "==============================\n";
         for (Function &F : M) {
             if (F.isDeclaration()) continue;
             errs() << "Function Name: " << F.getName() << "\n";
@@ -42,7 +42,7 @@ namespace {
                     }
                 }
             }
-            errs() << "=============================\n";
+            errs() << "==============================\n";
         }
         return PreservedAnalyses::all();
       }
